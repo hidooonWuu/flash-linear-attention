@@ -822,14 +822,18 @@ def test_fused_recurrent_npu_verifier(case, dtype, reason):
 
 @pytest.mark.skipif(not IS_NPU, reason='Ascend dispatch and launch splitting require NPU')
 @pytest.mark.parametrize('varlen', [False, True], ids=['dense', 'varlen'])
-def test_chunk_npu_launch_splits(varlen, monkeypatch):
-    """Split launches must retain native-reference numerics and dispatch both leaf stages."""
+@pytest.mark.parametrize('budget', [4, 4096], ids=['split', 'single'])
+def test_chunk_npu_launch_splits(varlen, budget, monkeypatch):
+    """Check product launch grids and native-reference numerics across packed and dense inputs."""
     from fla.ops.gdn2.backends.triton_ascend import chunk_intra
     from fla.ops.gdn2.chunk_bwd import chunk_gdn2_bwd_wy_dqkg_fused
     from fla.ops.gdn2.chunk_intra import chunk_gdn2_fwd_intra
 
     # exercise multiple launches and packed sequence boundaries with a small reference workload.
-    monkeypatch.setattr(chunk_intra, 'LAUNCH_BLOCK_BUDGET', 4)
+    monkeypatch.setattr(chunk_intra, 'LAUNCH_BLOCK_BUDGET', budget)
+    product = chunk_intra.chunk_gdn2_fwd_kernel_inter_products_npu
+    launches = Mock(wraps=product.run)
+    monkeypatch.setattr(product, 'run', launches)
     fwd = backends._function_registries[inspect.unwrap(chunk_gdn2_fwd_intra)]._backends['triton_ascend']
     bwd = backends._function_registries[inspect.unwrap(chunk_gdn2_bwd_wy_dqkg_fused)]._backends['triton_ascend']
     fwd_spy = Mock(wraps=fwd.implementation)
@@ -862,6 +866,12 @@ def test_chunk_npu_launch_splits(varlen, monkeypatch):
         )
     fwd_spy.assert_called_once()
     bwd_spy.assert_called_once()
+    grids = [call.kwargs['grid'] for call in launches.call_args_list]
+    assert grids and all(math.prod(grid) <= budget for grid in grids)
+    if budget == 4:
+        assert len(grids) > 1
+    else:
+        assert len(grids) == 1 and grids[0][2] == 6
 
 
 @pytest.mark.skipif(not (IS_NVIDIA or IS_AMD or IS_NPU), reason="CUDA/ROCm or Ascend NPU required")

@@ -25,7 +25,7 @@ from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp2
 from fla.ops.utils.triton_ascend.addressing import mload, mstore, token_rows
 from fla.utils import ascend_compile_kwargs, input_guard
-from fla.utils.ascend_ub_manager import compute_row_tile_block_size, iter_axis_launch_chunks
+from fla.utils.ascend_ub_manager import compute_row_tile_block_size, iter_axis_launch_chunks, launch_grid_chunked
 
 # the grouped diagonal kernel keeps the padded K dimension in one UB slab.
 MAX_FWD_INTRA_BK = 256
@@ -277,7 +277,7 @@ def chunk_gdn2_fwd_kernel_diag_solve_npu(
     tl.store(p_Akk, b_Ai.to(Akkd.dtype.element_ty), mask=m_p_Akk)
 
 
-@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET'])
+@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET', 'PAIR_OFFSET'])
 def chunk_gdn2_fwd_kernel_inter_products_npu(
     q,
     k,
@@ -294,13 +294,12 @@ def chunk_gdn2_fwd_kernel_inter_products_npu(
     BT: tl.constexpr,
     BC: tl.constexpr,
     BK: tl.constexpr,
-    DST_BLOCK: tl.constexpr,
-    SRC_BLOCK: tl.constexpr,
     IS_HEAD_MAJOR: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     MASK_DMA: tl.constexpr,
     NT_OFFSET,
     BH_OFFSET,
+    PAIR_OFFSET,
 ):
     i_t = tl.program_id(0) + NT_OFFSET
     i_bh = tl.program_id(1) + BH_OFFSET
@@ -316,8 +315,13 @@ def chunk_gdn2_fwd_kernel_inter_products_npu(
     else:
         bos = tl.cast(i_b, tl.int64) * T
 
-    i_tc_dst = i_t * BT + DST_BLOCK * BC
-    i_tc_src = i_t * BT + SRC_BLOCK * BC
+    # Four subchunks have lower-triangular block rows of lengths 1, 2, and 3.
+    tl.static_assert(BT == 4 * BC)
+    pair = tl.program_id(2) + PAIR_OFFSET
+    dst_block = tl.where(pair < 1, 1, tl.where(pair < 3, 2, 3))
+    src_block = pair - dst_block * (dst_block - 1) // 2
+    i_tc_dst = i_t * BT + dst_block * BC
+    i_tc_src = i_t * BT + src_block * BC
 
     if IS_HEAD_MAJOR:
         if IS_VARLEN:
@@ -379,7 +383,7 @@ def chunk_gdn2_fwd_kernel_inter_products_npu(
         b_Aqk += tl.dot(b_q_dst * b_gq, b_kgt, allow_tf32=False)
         b_Akk += tl.dot((b_b_dst * b_k_dst) * b_gq, b_kgt, allow_tf32=False)
 
-    o_col = SRC_BLOCK * BC + tl.arange(0, BC)
+    o_col = src_block * BC + tl.arange(0, BC)
     m_col = (o_col >= 0) & (o_col < BT)
     m_p_Aqk = m_dst[:, None] & m_col[None, :]
     p_Aqk = dma_rows(Aqk, i_tc_dst, dst_rows[:, None], H * BT, MASK_DMA) + o_col[None, :]
@@ -734,36 +738,33 @@ def chunk_gdn2_fwd_intra_npu(
     )
     inter_bk = _get_inter_bk(K)
     mask_inter = need_dma_mask(T, BC, K, inter_bk, K, inter_bk, is_varlen, cu_seqlens)
-    product_kwargs = dict(
-        q=q_intra if use_head_major_intra else q,
-        k=k_intra if use_head_major_intra else k,
-        g=g_intra if use_head_major_intra else gk,
-        b=b_intra if use_head_major_intra else b,
-        Aqk=Aqk,
-        Akkx=Akkx,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        T=T,
-        H=H,
-        K=K,
-        BT=BT,
-        BC=BC,
-        BK=inter_bk,
-        IS_HEAD_MAJOR=use_head_major_intra,
-        IS_VARLEN=is_varlen,
-        MASK_DMA=mask_inter,
-        NT_OFFSET=0,
-        BH_OFFSET=0,
+    launch_grid_chunked(
+        chunk_gdn2_fwd_kernel_inter_products_npu,
+        (NT, B * H, NC * (NC - 1) // 2),
+        offset_keys=('NT_OFFSET', 'BH_OFFSET', 'PAIR_OFFSET'),
+        budget=LAUNCH_BLOCK_BUDGET,
+        compile_kwargs=INTER_COMPILE_KWARGS,
+        kernel_kwargs=dict(
+            q=q_intra if use_head_major_intra else q,
+            k=k_intra if use_head_major_intra else k,
+            g=g_intra if use_head_major_intra else gk,
+            b=b_intra if use_head_major_intra else b,
+            Aqk=Aqk,
+            Akkx=Akkx,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=T,
+            H=H,
+            K=K,
+            BT=BT,
+            BC=BC,
+            BK=inter_bk,
+            IS_HEAD_MAJOR=use_head_major_intra,
+            IS_VARLEN=is_varlen,
+            MASK_DMA=mask_inter,
+        ),
     )
-    for dst_block in range(1, NC):
-        for src_block in range(dst_block):
-            launch_inter_kernel(
-                chunk_gdn2_fwd_kernel_inter_products_npu,
-                nt=NT,
-                bh_total=B * H,
-                kernel_kwargs=dict(product_kwargs, DST_BLOCK=dst_block, SRC_BLOCK=src_block),
-            )
     launch_inter_kernel(
         chunk_gdn2_fwd_kernel_inter_solve_npu,
         nt=NT,
