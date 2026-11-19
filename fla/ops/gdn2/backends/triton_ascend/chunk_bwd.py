@@ -9,6 +9,9 @@
 
 from __future__ import annotations
 
+from functools import cache
+from typing import NamedTuple
+
 import torch
 import triton
 import triton.language as tl
@@ -29,6 +32,35 @@ FALLBACK_TILE = 16
 MAX_TILE = 128
 
 
+class _WYBackwardConfig(NamedTuple):
+    compile_overrides: dict[str, int]
+    gate_dw_tiles: dict[int, int]
+    max_fused_gate_bk: int = 64
+    token_major_underfilled: bool = False
+
+
+_DEFAULT_WY_BACKWARD_CONFIG = _WYBackwardConfig(compile_overrides={}, gate_dw_tiles={})
+_WY_BACKWARD_CONFIGS = {
+    'Ascend950': _WYBackwardConfig(
+        # three vector slots exceed UB for the WY backward tiles on Ascend 950.
+        compile_overrides={'buf_slot_num_of_veccore': 1},
+        # full reduction tiles avoid an unsupported L1-to-L1 padding copy on Ascend 950.
+        gate_dw_tiles={48: 16},
+        max_fused_gate_bk=128,
+        token_major_underfilled=True,
+    ),
+}
+
+
+@cache
+def _get_wy_backward_config(device_index: int) -> _WYBackwardConfig:
+    device_name = torch.npu.get_device_name(device_index)
+    return next(
+        (config for prefix, config in _WY_BACKWARD_CONFIGS.items() if device_name.startswith(prefix)),
+        _DEFAULT_WY_BACKWARD_CONFIG,
+    )
+
+
 def get_bwd_tile(size: int, block_rows: int) -> int:
     return compute_row_tile_block_size(
         block_rows,
@@ -42,8 +74,13 @@ def get_bwd_tile(size: int, block_rows: int) -> int:
     )
 
 
-def prepare_time_contiguous_input(x: torch.Tensor, num_heads: int) -> tuple[torch.Tensor, bool]:
-    if num_heads == 1:
+def prepare_time_contiguous_input(
+    x: torch.Tensor,
+    num_heads: int,
+    *,
+    token_major: bool = False,
+) -> tuple[torch.Tensor, bool]:
+    if num_heads == 1 or token_major:
         return x, False
     return x.transpose(1, 2).contiguous(), True
 
@@ -625,57 +662,60 @@ def chunk_gdn2_bwd_kernel_wy_gate_part_npu(
         dk_ptr = dk + (bos * H + i_h) * K
         dw_ptr = gate_dw + (bos * H + i_h) * K
 
-        o_t = tl.cast(i_t, tl.int64) * BT + tl.arange(0, BT)
-        m_t = (o_t >= 0) & (o_t < T)
-        o_k = i_k * BK + tl.arange(0, BK)
-        m_k = (o_k >= 0) & (o_k < K)
-        m_p_k = m_t[:, None] & m_k[None, :]
-        p_k = k_ptr + o_t[:, None] * k_stride_t + o_k[None, :]
-        p_g = g_ptr + o_t[:, None] * g_stride_t + o_k[None, :]
-        p_b = b_ptr + o_t[:, None] * g_stride_t + o_k[None, :]
-        p_dw = dw_ptr + o_t[:, None] * (H * K) + o_k[None, :]
-        o_i = tl.arange(0, BT)
-        m_i = (o_i >= 0) & (o_i < BT)
-        m_p_A = m_i[:, None] & m_t[None, :]
-        p_A = A_ptr + o_i[:, None] + o_t[None, :] * a_stride_t
-        b_k = tl.load(p_k, mask=m_p_k, other=0)
-        b_g = tl.load(p_g, mask=m_p_k, other=0).to(tl.float32)
-        b_b = tl.load(p_b, mask=m_p_k, other=0)
-        b_A = tl.load(p_A, mask=m_p_A, other=0)
-        if MASK_A_NAN:
-            b_A = tl.where(m_p_A, b_A, 0)
-        b_dw = tl.load(p_dw, mask=m_p_k, other=0)
-        b_gk_exp = exp2(b_g)
-        b_kg = b_k * b_gk_exp
-        if K % BK != 0:
-            b_dw = tl.where(m_k[None, :], -b_dw.to(b_A.dtype), 0)
-            b_kg = tl.where(m_k[None, :], b_kg, 0)
-            b_gk_exp = tl.where(m_k[None, :], b_gk_exp, 0)
-            b_b = tl.where(m_k[None, :], b_b, 0)
-        else:
-            b_dw = -b_dw.to(b_A.dtype)
-        b_dkgb = tl.dot(b_A, b_dw, allow_tf32=False)
-        if K % BK != 0:
-            b_dkgb = tl.where(m_k[None, :], b_dkgb, 0)
+        # bound the live gate tiles while keeping all K slices in one launch.
+        DOT_BK: tl.constexpr = min(BK, 64)
+        for i_s in tl.range(BK // DOT_BK, loop_unroll_factor=1):
+            o_t = tl.cast(i_t, tl.int64) * BT + tl.arange(0, BT)
+            m_t = (o_t >= 0) & (o_t < T)
+            o_k = i_k * BK + i_s * DOT_BK + tl.arange(0, DOT_BK)
+            m_k = (o_k >= 0) & (o_k < K)
+            m_p_k = m_t[:, None] & m_k[None, :]
+            p_k = k_ptr + o_t[:, None] * k_stride_t + o_k[None, :]
+            p_g = g_ptr + o_t[:, None] * g_stride_t + o_k[None, :]
+            p_b = b_ptr + o_t[:, None] * g_stride_t + o_k[None, :]
+            p_dw = dw_ptr + o_t[:, None] * (H * K) + o_k[None, :]
+            o_i = tl.arange(0, BT)
+            m_i = (o_i >= 0) & (o_i < BT)
+            m_p_A = m_i[:, None] & m_t[None, :]
+            p_A = A_ptr + o_i[:, None] + o_t[None, :] * a_stride_t
+            b_k = tl.load(p_k, mask=m_p_k, other=0)
+            b_g = tl.load(p_g, mask=m_p_k, other=0).to(tl.float32)
+            b_b = tl.load(p_b, mask=m_p_k, other=0)
+            b_A = tl.load(p_A, mask=m_p_A, other=0)
+            if MASK_A_NAN:
+                b_A = tl.where(m_p_A, b_A, 0)
+            b_dw = tl.load(p_dw, mask=m_p_k, other=0)
+            b_gk_exp = exp2(b_g)
+            b_kg = b_k * b_gk_exp
+            if K % BK != 0:
+                b_dw = tl.where(m_k[None, :], -b_dw.to(b_A.dtype), 0)
+                b_kg = tl.where(m_k[None, :], b_kg, 0)
+                b_gk_exp = tl.where(m_k[None, :], b_gk_exp, 0)
+                b_b = tl.where(m_k[None, :], b_b, 0)
+            else:
+                b_dw = -b_dw.to(b_A.dtype)
+            b_dkgb = tl.dot(b_A, b_dw, allow_tf32=False)
+            if K % BK != 0:
+                b_dkgb = tl.where(m_k[None, :], b_dkgb, 0)
 
-        m_p_dA = m_t[:, None] & m_i[None, :]
-        p_dA = dA_ptr + o_t[:, None] * (H * BT) + o_i[None, :]
-        b_dA = tl.load(p_dA, mask=m_p_dA, other=0).to(tl.float32)
-        b_dA += tl.dot(b_dw, tl.trans((b_kg * b_b).to(b_A.dtype)), allow_tf32=False)
-        tl.store(p_dA, b_dA.to(p_dA.dtype.element_ty), mask=m_p_dA)
+            m_p_dA = m_t[:, None] & m_i[None, :]
+            p_dA = dA_ptr + o_t[:, None] * (H * BT) + o_i[None, :]
+            b_dA = tl.load(p_dA, mask=m_p_dA, other=0).to(tl.float32)
+            b_dA += tl.dot(b_dw, tl.trans((b_kg * b_b).to(b_A.dtype)), allow_tf32=False)
+            tl.store(p_dA, b_dA.to(p_dA.dtype.element_ty), mask=m_p_dA)
 
-        p_db = db_ptr + o_t[:, None] * (H * K) + o_k[None, :]
-        tl.store(p_db, (b_dkgb * b_kg).to(p_db.dtype.element_ty), mask=m_p_k)
+            p_db = db_ptr + o_t[:, None] * (H * K) + o_k[None, :]
+            tl.store(p_db, (b_dkgb * b_kg).to(p_db.dtype.element_ty), mask=m_p_k)
 
-        p_dk = dk_ptr + o_t[:, None] * (H * K) + o_k[None, :]
-        b_dk = tl.load(p_dk, mask=m_p_k, other=0).to(tl.float32)
-        b_dk += b_dkgb * b_gk_exp * b_b
-        tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), mask=m_p_k)
+            p_dk = dk_ptr + o_t[:, None] * (H * K) + o_k[None, :]
+            b_dk = tl.load(p_dk, mask=m_p_k, other=0).to(tl.float32)
+            b_dk += b_dkgb * b_gk_exp * b_b
+            tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), mask=m_p_k)
 
-        p_dg = dg_ptr + o_t[:, None] * (H * K) + o_k[None, :]
-        b_dg = tl.load(p_dg, mask=m_p_k, other=0).to(tl.float32)
-        b_dg += b_kg * b_dkgb * b_b
-        tl.store(p_dg, b_dg.to(p_dg.dtype.element_ty), mask=m_p_k)
+            p_dg = dg_ptr + o_t[:, None] * (H * K) + o_k[None, :]
+            b_dg = tl.load(p_dg, mask=m_p_k, other=0).to(tl.float32)
+            b_dg += b_kg * b_dkgb * b_b
+            tl.store(p_dg, b_dg.to(p_dg.dtype.element_ty), mask=m_p_k)
 
 
 @triton.jit(do_not_specialize=['T', 'task_num', 'num_core', 'BH', 'NT_OFFSET'])
@@ -866,17 +906,22 @@ def chunk_gdn2_bwd_wy_dqkg_fused_npu(
     if K % 64 and k.dtype in (torch.float16, torch.bfloat16):
         BK = min(BK, 32)
     BV = get_bwd_tile(V, block_rows=bc_k)
+    config = _get_wy_backward_config(k.device.index)
+    compile_kwargs = ascend_compile_kwargs()
+    compile_kwargs.update(config.compile_overrides)
     NK = triton.cdiv(K, BK)
     is_varlen = cu_seqlens is not None
     chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT) if is_varlen else g.new_zeros(1, dtype=torch.int64)
     bh_total = B * H
     task_num = NT * bh_total
     num_core = get_npu_properties()['num_vectorcore']
+    # A single wave of WY tasks can read token-major inputs directly.
+    token_major = config.token_major_underfilled and task_num <= num_core
 
-    v_arg, t_contig = prepare_time_contiguous_input(v, H)
-    w_arg = prepare_time_contiguous_input(w_gate, H)[0]
-    A_arg = prepare_time_contiguous_input(A, H)[0]
-    dv_arg = prepare_time_contiguous_input(dv, H)[0]
+    v_arg, t_contig = prepare_time_contiguous_input(v, H, token_major=token_major)
+    w_arg = prepare_time_contiguous_input(w_gate, H, token_major=token_major)[0]
+    A_arg = prepare_time_contiguous_input(A, H, token_major=token_major)[0]
+    dv_arg = prepare_time_contiguous_input(dv, H, token_major=token_major)[0]
     chunk_gdn2_bwd_kernel_wy_v_part_npu[(num_core,)](
         v=v_arg,
         w_gate=w_arg,
@@ -897,7 +942,7 @@ def chunk_gdn2_bwd_wy_dqkg_fused_npu(
         BV=BV,
         IS_VARLEN=is_varlen,
         T_CONTIG=t_contig,
-        **ascend_compile_kwargs(),
+        **compile_kwargs,
     )
 
     mask_dma = need_dma_mask(T, BT, K, BK, V, BV, is_varlen, cu_seqlens) or BT % bc_k != 0
@@ -937,11 +982,10 @@ def chunk_gdn2_bwd_wy_dqkg_fused_npu(
         k_part_kwargs['K_OFFSET'] = k_off
         chunk_kda_bwd_kernel_wy_k_part_npu[(num_core,)](**k_part_kwargs, **ascend_compile_kwargs())
 
-    k_arg, k_t_contig = prepare_time_contiguous_input(k, H)
-    g_arg, g_t_contig = prepare_time_contiguous_input(g, H)
-    b_arg = prepare_time_contiguous_input(b, H)[0]
+    k_arg, k_t_contig = prepare_time_contiguous_input(k, H, token_major=token_major)
+    g_arg, g_t_contig = prepare_time_contiguous_input(g, H, token_major=token_major)
+    b_arg = prepare_time_contiguous_input(b, H, token_major=token_major)[0]
     gate_dw = torch.empty(B, T, H, K, dtype=torch.float32, device=k.device)
-    compile_kwargs = ascend_compile_kwargs()
     dw_kwargs = dict(
         h=h,
         dv=dv_arg,
@@ -958,7 +1002,7 @@ def chunk_gdn2_bwd_wy_dqkg_fused_npu(
         V=V,
         BT=BT,
         BK=BK,
-        BV=BV,
+        BV=config.gate_dw_tiles.get(V, BV),
         STATE_V_FIRST=state_v_first,
         IS_VARLEN=is_varlen,
         G_T_CONTIG=g_t_contig,
@@ -1010,10 +1054,9 @@ def chunk_gdn2_bwd_wy_dqkg_fused_npu(
         G_T_CONTIG=g_t_contig,
         MASK_A_NAN=mask_a_nan,
     )
-    # fp32 keeps [BT, BK] tiles at full width and overflows the 192KiB UB budget
-    # at BK=64. Larger half-precision tiles also need the split path; BK=32
-    # handles a partial K tile in the fused kernel with explicit lane masks.
-    split_gate = BK > 64 or (BK > 32 and K % BK != 0) or k.dtype == torch.float32
+    # fp32 and partial K tiles retain the split path to bound UB usage.
+    # wider fused tiles require a validated device policy and internal K slicing.
+    split_gate = config.max_fused_gate_bk < BK or (BK > 32 and K % BK != 0) or k.dtype == torch.float32
     if split_gate:
         gate_dkgb = torch.empty(B, T, H, K, dtype=torch.float32, device=k.device)
         dkgb_kwargs = dict(
@@ -1082,7 +1125,7 @@ def chunk_gdn2_bwd_wy_dqkg_fused_npu(
         BT=BT,
         IS_VARLEN=is_varlen,
         A_T_CONTIG=t_contig,
-        **ascend_compile_kwargs(),
+        **compile_kwargs,
     )
     if is_varlen:
         finalize_kwargs['task_num'] = NT * bh_total

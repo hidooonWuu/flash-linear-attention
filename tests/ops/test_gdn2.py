@@ -360,9 +360,13 @@ def test_chunk_invalid_chunk_size(chunk_size):
             (2, 256, 2, 64, 64, 0.5, True, False, False, torch.float32),
             (2, 100, 3, 64, 64, 1.0, True, False, False, torch.float16),
             (1, 64, 1, 128, 128, 1.0, True, False, False, torch.bfloat16),
+            (1, 65, 2, 128, 48, 1.0, True, False, False, torch.float16),
+            (1, 64, 2, 256, 128, 1.0, True, False, False, torch.float16),
             (1, 64, 1, 256, 256, 1.0, True, False, False, torch.bfloat16),
             (1, 65, 2, 48, 32, 1.0, True, False, False, torch.float16),
             (1, 65, 2, 32, 48, 1.0, True, False, False, torch.float16),
+            # exercise the V=48 gate_dw reduction with a full time tile as well as the tail above.
+            (1, 64, 2, 32, 48, 1.0, True, False, False, torch.float16),
             (2, 256, 2, 64, 64, 1.0, True, True, False, torch.float32),
             (1, 128, 2, 64, 64, 1.0, True, True, True, torch.float32),
         ]
@@ -1510,3 +1514,85 @@ def test_recompute_w_u_fwd_gdn2_ub_budget(store_qg, expected, monkeypatch):
         monkeypatch.setattr(ascend_ub_manager, '_ub_manager', ascend_ub_manager.UBManager(capacity))
         plans.append(_get_fwd_tiles(64, 256, 512, store_qg=store_qg, ub_capacity_bits=capacity))
     assert plans == expected
+
+
+def test_chunk_bwd_intra_device_policy(monkeypatch):
+    from fla.ops.gdn2 import chunk_intra
+
+    jit_kernel = object()
+    wrapped_kernel = SimpleNamespace(fn=SimpleNamespace(fn=jit_kernel))
+    device_names = ['Ascend950DT_9582', 'Ascend910_9382']
+    get_name = Mock(side_effect=lambda index: device_names[index])
+    monkeypatch.setattr(torch, 'npu', SimpleNamespace(get_device_name=get_name), raising=False)
+    monkeypatch.setattr(chunk_intra, 'IS_NPU', True)
+    monkeypatch.setattr(chunk_intra, 'chunk_gdn2_bwd_kernel_intra', wrapped_kernel)
+    select = chunk_intra._get_bwd_intra_kernel
+    select.cache_clear()
+    try:
+        assert select(0) == (jit_kernel, True)
+        assert select(1) == (wrapped_kernel, False)
+        assert select(0) == (jit_kernel, True)
+        assert get_name.call_count == 2
+    finally:
+        select.cache_clear()
+
+
+@pytest.mark.skipif(not IS_NPU, reason='Ascend 950 backward scheduling')
+@pytest.mark.parametrize('safe_gate', [False, True], ids=['default-gate', 'safe-gate'])
+@pytest.mark.parametrize(
+    ('B', 'T', 'H', 'K', 'V', 'dtype', 'bounds', 'state_v_first', 'disable_recompute'),
+    [
+        pytest.param(1, 256, 4, 128, 128, torch.bfloat16, None, False, False, id='dense256'),
+        pytest.param(1, 145, 2, 48, 32, torch.float16, [0, 15, 80, 145], False, False, id='ragged'),
+        pytest.param(1, 145, 2, 48, 32, torch.float16, [0, 15, 80, 145], True, True, id='ragged-saved-v-first'),
+        pytest.param(2, 65, 1, 32, 48, torch.float32, None, False, False, id='dense-tail-fp32'),
+    ],
+)
+def test_chunk_a5_backward_schedule(
+    B, T, H, K, V, dtype, bounds, state_v_first, disable_recompute, safe_gate, monkeypatch,
+):
+    from fla.ops.gdn2 import chunk_intra
+    from fla.ops.gdn2.backends.triton_ascend import chunk_bwd
+
+    if not torch.npu.get_device_name().startswith('Ascend950'):
+        pytest.skip('requires Ascend 950')
+    q, k, v, g, b, w, _, _ = _rand_inputs(B, T, H, H, K, V, dtype)
+    num_states = len(bounds) - 1 if bounds else B
+    h0 = torch.randn(num_states, H, K, V, dtype=torch.float32, device=device)
+    leaves = [x.requires_grad_() for x in (q, k, v, g, b, w, h0)]
+    do, dht = torch.randn_like(v), torch.randn_like(h0)
+    cu = torch.tensor(bounds, dtype=torch.int64, device=device) if bounds else None
+    get_config = chunk_bwd._get_wy_backward_config
+    autotuned_kernel = chunk_intra.chunk_gdn2_bwd_kernel_intra
+    jit_kernel, direct_db = chunk_intra._get_bwd_intra_kernel(k.device.index)
+    assert direct_db
+    reference = None
+    for token_major, direct_intra in [(False, False), (True, False), (False, True), (True, True)]:
+        monkeypatch.setattr(
+            chunk_bwd, '_get_wy_backward_config',
+            lambda index: get_config(index)._replace(token_major_underfilled=token_major),
+        )
+        monkeypatch.setattr(
+            chunk_intra, '_get_bwd_intra_kernel',
+            lambda index: (jit_kernel, True) if direct_intra else (autotuned_kernel, False),
+        )
+        o, ht = chunk_gdn2(
+            q=q, k=k, v=v, g=g, b=b, w=w,
+            initial_state=h0.transpose(-1, -2).contiguous() if state_v_first else h0,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=cu,
+            safe_gate=safe_gate,
+            state_v_first=state_v_first,
+            disable_recompute=disable_recompute,
+        )
+        if state_v_first:
+            ht = ht.transpose(-1, -2)
+        grads = torch.autograd.grad((o, ht), leaves, grad_outputs=(do, dht))
+        actual = [x.detach() for x in (o, ht, *grads)]
+        assert all(torch.isfinite(x).all() for x in actual)
+        if reference is None:
+            reference = actual
+        else:
+            for name, expected, result in zip(('o', 'ht', 'dq', 'dk', 'dv', 'dg', 'db', 'dw', 'dh0'), reference, actual):
+                torch.testing.assert_close(result, expected, rtol=0, atol=0, msg=name)

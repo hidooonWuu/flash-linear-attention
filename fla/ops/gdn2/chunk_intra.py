@@ -20,6 +20,8 @@
 # the K axis instead of a per-head scalar ``beta``; the b tensor is folded into
 # the relevant tiles directly rather than applied as a row-scalar multiply.
 
+from functools import cache
+
 import torch
 import triton
 import triton.language as tl
@@ -465,6 +467,7 @@ def chunk_gdn2_bwd_kernel_intra(
     SAFE_GATE: tl.constexpr,
     GATE_SHIFT: tl.constexpr,
     USE_GATHER: tl.constexpr,
+    DB_TOKEN_MAJOR: tl.constexpr = False,
 ):
     i_kc, i_t = unflatten_program_id(tl.cdiv(K, BK) * NC)
     i_bh = tl.program_id(1).to(tl.int64)
@@ -499,7 +502,10 @@ def chunk_gdn2_bwd_kernel_intra(
     dk2 += (bos * H + i_h) * K
     dg += (bos * H + i_h) * K
     dg2 += (bos * H + i_h) * K
-    db += (i_k * all + bos) * H * BK + i_h * BK
+    if DB_TOKEN_MAJOR:
+        db += (bos * H + i_h) * K
+    else:
+        db += (i_k * all + bos) * H * BK + i_h * BK
 
     o_i = tl.arange(0, BC)
     o_c = i_ti + o_i
@@ -592,11 +598,15 @@ def chunk_gdn2_bwd_kernel_intra(
     b_db_tile = b_dk2 * b_k
     b_dk2 = b_dk2 * b_b
 
-    o_db = tl.arange(0, BK)
-    m_db = m_c[:, None] & (o_db[None, :] < BK)
+    if DB_TOKEN_MAJOR:
+        p_db = db + o_c[:, None] * (H * K) + o_k[None, :]
+        m_db = m_kc
+    else:
+        o_db = tl.arange(0, BK)
+        p_db = db + o_c[:, None] * (H * BK) + o_db[None, :]
+        m_db = m_c[:, None] & (o_db[None, :] < BK)
     p_dq = dq + o_c[:, None] * (H * K) + o_k[None, :]
     p_dq2 = dq2 + o_c[:, None] * (H * K) + o_k[None, :]
-    p_db = db + o_c[:, None] * (H * BK) + o_db[None, :]
 
     b_dg2 = b_q * b_dq2
     b_dq2 = b_dq2 + tl.load(p_dq, mask=m_kc, other=0.0)
@@ -807,6 +817,15 @@ def chunk_gdn2_fwd_intra(
     return w, u, qg, kg, Aqk, Akk
 
 
+@cache
+def _get_bwd_intra_kernel(device_index: int):
+    kernel = chunk_gdn2_bwd_kernel_intra
+    if IS_NPU and torch.npu.get_device_name(device_index).startswith('Ascend950'):
+        # BC/BK are fixed on this route. Unwrap heuristics and autotuning once per device.
+        return kernel.fn.fn, True
+    return kernel, False
+
+
 def chunk_gdn2_bwd_intra(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -842,11 +861,14 @@ def chunk_gdn2_bwd_intra(
 
     dq2 = torch.empty_like(q)
     dk2 = torch.empty_like(k)
-    db2 = q.new_empty(NK, B, T, H, BK, dtype=torch.float32)
+    kernel, db_token_major = _get_bwd_intra_kernel(k.device.index)
+    db2 = q.new_empty(B, T, H, K, dtype=torch.float32) if db_token_major else q.new_empty(
+        NK, B, T, H, BK, dtype=torch.float32,
+    )
     dg2 = torch.empty_like(dg, dtype=torch.float32)
 
     grid = (NK * NC * NT, B * H)
-    chunk_gdn2_bwd_kernel_intra[grid](
+    kernel[grid](
         q=q,
         k=k,
         g=g,
@@ -870,13 +892,17 @@ def chunk_gdn2_bwd_intra(
         BC=BC,
         BK=BK,
         NC=NC,
+        IS_VARLEN=cu_seqlens is not None,
+        DB_TOKEN_MAJOR=db_token_major,
         SAFE_GATE=safe_gate,
         USE_GATHER=IS_GATHER_SUPPORTED,
         GATE_SHIFT=(-lower_bound if lower_bound is not None else 2.) * RCP_LN2,
     )
     dq = dq2
     dk = dk2
-    db2_combined = db2.permute(1, 2, 3, 0, 4).contiguous().reshape(B, T, H, NK * BK)[..., :K]
+    db2_combined = db2 if db_token_major else db2.permute(
+        1, 2, 3, 0, 4,
+    ).contiguous().reshape(B, T, H, NK * BK)[..., :K]
     db = db.add_(db2_combined)
     dg = dg2
     return dq, dk, db, dg
