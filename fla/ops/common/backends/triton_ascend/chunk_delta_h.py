@@ -32,6 +32,7 @@ from fla.utils.ascend_ub_manager import (
     get_npu_properties,
     get_ub_manager,
 )
+from fla.utils.hardware import get_npu_arch_series, get_npu_target_arch
 
 
 @lru_cache(maxsize=4)
@@ -372,6 +373,8 @@ _SAFETY_MARGIN = 0.80
 _FALLBACK_BV = 16
 _MAX_BV = 64
 _FWD_H_BT = 64
+# Minimum D-cache reservation in the 950DT RegBase UB plan.
+_ASCEND950_UB_RESERVE_BYTES = 32 * 1024
 # live-range packing fits BK=256/BV=128 despite a peak estimate of 1.18 times physical UB capacity.
 _FWD_UB_SOFT = 1.20
 # Masked blockdim64 (unaligned T / varlen) is fatter than oneslab. D128 BK=128/BV=128
@@ -416,6 +419,7 @@ def _select_fwd_h_tiles(
     state_v_first: bool,
     *,
     masked: bool = False,
+    BT: int = _FWD_H_BT,
 ) -> tuple[int, int]:
     """Pick (BK, BV) minimizing ptr/scalar cost under a UB cap.
 
@@ -443,7 +447,7 @@ def _select_fwd_h_tiles(
         if n_slabs <= 4:
             bv = 16
             while bv <= min(desired_v, 256):
-                if _fwd_h_peak_bytes(BK=bk, BV=bv, n_slabs=n_slabs) <= soft_cap:
+                if _fwd_h_peak_bytes(BK=bk, BV=bv, n_slabs=n_slabs, BT=BT) <= soft_cap:
                     cost = _fwd_h_tile_cost(K=K, V=V, BK=bk, BV=bv)
                     if (
                         best is None
@@ -457,6 +461,57 @@ def _select_fwd_h_tiles(
     if best is None:
         return 64, _get_bv(K=K, V=V)
     return best[1], best[2]
+
+
+@lru_cache(maxsize=128)
+def _ascend950_masked_tail_tiles(
+    K: int, V: int, BT: int, heads: int, cores: int, ub_bytes: int,
+) -> tuple[int, int] | None:
+    """Rank aligned masked tiles by estimated work across waves of cores."""
+    budget = ub_bytes - _ASCEND950_UB_RESERVE_BYTES
+    best_tiles = None
+    best_cost = float('inf')
+    for bk in (256, 128, 64):
+        if K % bk:
+            continue
+        slabs = K // bk
+        for bv in (256, 128, 64, 32, 16):
+            if V % bv:
+                continue
+            # Empirical FP32 scratch allowance for masked loads and layout conversions.
+            peak = _fwd_h_peak_bytes(bk, bv, slabs, BT) + 3 * 4 * bk * (BT + bv)
+            if peak > budget:
+                continue
+            waves = triton.cdiv(heads * (V // bv), cores)
+            # Account for K/W loads, state traffic and per-slab intermediate work.
+            cost = waves * (2 * BT * K + K * bv + 2 * BT * bv * slabs)
+            if cost < best_cost:
+                best_cost = cost
+                best_tiles = (bk, bv)
+    return best_tiles
+
+
+def _select_dense_fwd_h_tail_tiles(
+    K: int, V: int, BT: int, *, arch: str, fp16: bool, heads: int,
+) -> tuple[int, int, bool]:
+    ascend950 = get_npu_arch_series(arch) == 'ascend950'
+    tile_bt = BT if ascend950 else _FWD_H_BT
+    BK, BV = _select_fwd_h_tiles(K, V, False, BT=tile_bt)
+    single_slab = K == BK and V % BV == 0
+    if single_slab and ascend950:
+        cap = get_ub_manager().ub_capacity_bytes * _FWD_UB_MASKED
+        single_slab = _fwd_h_peak_bytes(BK, BV, 1, BT) <= cap
+    if single_slab:
+        return BK, BV, True
+
+    if arch.lower() == 'ascend950dt_9582' and fp16 and heads:
+        tiles = _ascend950_masked_tail_tiles(
+            K, V, BT, heads, get_npu_properties()["num_aicore"], get_ub_manager().ub_capacity_bytes,
+        )
+        if tiles is not None:
+            return tiles[0], tiles[1], False
+    BK, BV = _select_fwd_h_tiles(K, V, False, masked=True, BT=tile_bt)
+    return BK, BV, False
 
 
 def _dhu_peak_bytes(
@@ -487,11 +542,6 @@ def _dhu_peak_bytes(
     return peak
 
 
-def _dhu_tile_cost(K: int, V: int, BK: int, BV: int) -> int:
-    """Reverse-loop scalar proxy: nv × (base ptrs + ~4 per K-slab)."""
-    return triton.cdiv(V, BV) * (3 + 4 * triton.cdiv(K, BK))
-
-
 def _select_bwd_dhu_tiles(
     K: int,
     V: int,
@@ -501,6 +551,7 @@ def _select_bwd_dhu_tiles(
     gate_inline: bool = False,
     masked: bool = False,
     use_gate: bool = False,
+    ascend950_tail_bt: int | None = None,
 ) -> tuple[int, int]:
     """Pick (BK, BV) minimizing launch×ptr cost under a soft UB cap.
 
@@ -516,8 +567,10 @@ def _select_bwd_dhu_tiles(
     inline_cap = int(ub * _DHU_UB_GATE_INLINE)
     soft_cap = int(ub * _DHU_UB_SOFT)
     masked_cap = int(ub * _DHU_UB_MASKED)
+    if ascend950_tail_bt is not None:
+        masked_cap = min(masked_cap, ub - _ASCEND950_UB_RESERVE_BYTES)
     # bwd kernel is blockdim64: K is covered by up to four BK=64 slabs only.
-    max_bk = 64
+    bk = 64
     desired_v = min(
         triton.next_power_of_2(V),
         max(16, triton.next_power_of_2(triton.cdiv(V, min_nv))),
@@ -525,37 +578,32 @@ def _select_bwd_dhu_tiles(
     # partial K/V slabs plus tail-token masking can exceed UB with BV > 64 (e.g. D=100).
     if K % 64 or V % 64:
         desired_v = min(desired_v, 64)
-    best: tuple[int, int, int] | None = None  # cost, BK, BV
-
-    bk = 64
-    while bk <= max_bk:
-        n_slabs = triton.cdiv(K, bk)
-        bv = 16
-        while bv <= min(desired_v, 256):
-            partial = (K % bk != 0) or (V % bv != 0)
-            if gate_inline:
-                cap = inline_cap
-            elif partial:
-                cap = ub
-            elif masked:
-                cap = masked_cap
-            else:
-                cap = soft_cap
-            # The 2D row select is compiled whenever DMA is masked: varlen, a ragged
-            # chunk, or a partial K/V tile.
-            if _dhu_peak_bytes(
-                bk, bv, n_slabs, partial_kv=partial, row_select=masked or partial,
-                use_gate=use_gate,
-            ) <= cap:
-                cost = _dhu_tile_cost(K, V, bk, bv)
-                if best is None or cost < best[0] or (cost == best[0] and bk > best[1]):
-                    best = (cost, bk, bv)
-            bv *= 2
-        bk *= 2
-
-    if best is None:
-        return 64, _get_bv(K=K, V=V)
-    return best[1], best[2]
+    n_slabs = triton.cdiv(K, bk)
+    # With BK fixed, a wider BV always needs fewer V tiles in this candidate range.
+    for bv in (256, 128, 64, 32, 16):
+        if bv > desired_v:
+            continue
+        partial = (K % bk != 0) or (V % bv != 0)
+        if gate_inline:
+            cap = inline_cap
+        elif partial:
+            cap = ub
+        elif masked:
+            cap = masked_cap
+        else:
+            cap = soft_cap
+        # The 2D row select is compiled whenever DMA is masked: varlen, a ragged
+        # chunk, or a partial K/V tile.
+        peak = _dhu_peak_bytes(
+            bk, bv, n_slabs, BT=ascend950_tail_bt or _DHU_BT,
+            partial_kv=partial, row_select=masked or partial, use_gate=use_gate,
+        )
+        if ascend950_tail_bt is not None:
+            # Headroom for BT x BV gradient temporaries in the masked 950DT lowering.
+            peak += 2 * ascend950_tail_bt * bv * 4
+        if peak <= cap:
+            return bk, bv
+    return bk, _get_bv(K=K, V=V)
 
 
 def _launch_core_grid(kernel, *, task_num: int, kernel_kwargs: dict, **compile_opts) -> None:
@@ -1061,13 +1109,6 @@ def _dense_chunk_store(base, row_base, lanes, cols, values, T, STRIDE: tl.conste
         tl.store((base + row_base * STRIDE) + lanes * STRIDE + cols, values)
 
 
-def _dense_single_slab_tail(K, V, state_v_first, g, cu_seqlens):
-    if cu_seqlens is not None or state_v_first or g is not None:
-        return False
-    BK, BV = _select_fwd_h_tiles(K, V, False)
-    return K == BK and V % BV == 0
-
-
 @triton.heuristics(
     {
         "USE_G": lambda args: args["g_ratio"] is not None,
@@ -1281,8 +1322,14 @@ def chunk_gated_delta_rule_fwd_h_npu(
 
     # blockdim64 keeps T/K/V masks (and inline exp2 when T % BT != 0).
     masked = time_axis_needs_mask(T, BT, cu_seqlens, cu_seqlens_cpu)
-    dense_tail = T % BT != 0 and _dense_single_slab_tail(K, V, state_v_first, g, cu_seqlens)
-    BK, BV = _select_fwd_h_tiles(K, V, state_v_first, masked=masked and not dense_tail)
+    if T % BT and cu_seqlens is None and not state_v_first and g is None:
+        BK, BV, dense_tail = _select_dense_fwd_h_tail_tiles(
+            K, V, BT, arch=get_npu_target_arch() if gk is None else '',
+            fp16=k.dtype == w.dtype == u.dtype == torch.float16, heads=B * HV,
+        )
+    else:
+        BK, BV = _select_fwd_h_tiles(K, V, state_v_first, masked=masked)
+        dense_tail = False
     # Partial K/V tiles take the masked DMA path. That path keeps a second image
     # of the state plus the w/v operands: BK=128/BV=128 asks for 230528 B against
     # 192 KiB. Zero-pad onto the tile already chosen so the unmasked kernel runs
@@ -2034,6 +2081,10 @@ def chunk_gated_delta_rule_bwd_dhu_npu(
         gate_inline=gate_inline,
         masked=masked,
         use_gate=g is not None,
+        ascend950_tail_bt=BT if (
+            T % BT and cu_seqlens is None and not state_v_first and g is None and gk is None
+            and K % 64 == 0 and V % 64 == 0 and q.dtype == torch.float16 and get_npu_target_arch().lower() == 'ascend950dt_9582'
+        ) else None,
     )
     # unit_flag overlaps cube and fixpipe. On the v-first transpose path that
     # overlap deadlocks when the sequence is ragged or packed, and the device

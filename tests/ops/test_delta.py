@@ -14,16 +14,20 @@ from fla.utils import assert_close, device, device_platform
 
 
 @pytest.mark.parametrize(
-    ('B', 'T', 'H', 'D', 'scale', 'use_qk_l2norm_in_kernel', 'dtype'),
+    ('B', 'T', 'H', 'K', 'V', 'scale', 'use_qk_l2norm_in_kernel', 'dtype'),
     [
-        pytest.param(*test, id="B{}-T{}-H{}-D{}-scale{}-{}".format(*test))
+        pytest.param(*test, id="B{}-T{}-H{}-K{}-V{}-scale{}-{}".format(*test))
         for test in [
-            (1, 63, 1, 64, 1, False, torch.float16),
-            (2, 100, 4, 60, 0.1, False, torch.float16),
-            (2, 1000, 3, 128, 0.1, False, torch.float16),
-            (2, 1024, 4, 128, 1, True, torch.float16),
-            (3, 2000, 4, 128, 0.1, False, torch.float16),
-            (4, 2048, 8, 64, 0.1, False, torch.float16),
+            (1, 63, 1, 64, 64, 1, False, torch.float16),
+            (2, 100, 4, 60, 60, 0.1, False, torch.float16),
+            (2, 1000, 3, 128, 128, 0.1, False, torch.float16),
+            (2, 1000, 3, 128, 256, 0.1, False, torch.float16),
+            (2, 1000, 3, 256, 128, 0.1, False, torch.float16),
+            (2, 1000, 3, 256, 256, 0.1, False, torch.float16),
+            (2, 1024, 4, 128, 128, 1, True, torch.float16),
+            (3, 2000, 4, 128, 128, 0.1, False, torch.float16),
+            (3, 2000, 4, 128, 256, 0.1, False, torch.float16),
+            (4, 2048, 8, 64, 64, 0.1, False, torch.float16),
         ]
     ],
 )
@@ -35,17 +39,18 @@ def test_chunk(
     B: int,
     T: int,
     H: int,
-    D: int,
+    K: int,
+    V: int,
     scale: float,
     use_qk_l2norm_in_kernel: bool,
     dtype: torch.dtype,
 ):
     torch.manual_seed(42)
-    q = torch.randn(B, T, H, D, dtype=dtype)
-    k = torch.randn(B, T, H, D, dtype=dtype)
-    v = torch.randn(B, T, H, D, dtype=dtype)
+    q = torch.randn(B, T, H, K, dtype=dtype)
+    k = torch.randn(B, T, H, K, dtype=dtype)
+    v = torch.randn(B, T, H, V, dtype=dtype)
     beta = torch.randn(B, T, H, dtype=dtype).sigmoid()
-    h0 = torch.randn(B, H, D, D, dtype=torch.float32)
+    h0 = torch.randn(B, H, K, V, dtype=torch.float32)
     q, k, v, beta, h0 = map(lambda x: x.to(device).requires_grad_(True), (q, k, v, beta, h0))
     do = torch.rand_like(v)
     dht = torch.rand_like(h0)
@@ -93,6 +98,7 @@ def test_chunk(
         for chunk_size in [16, 32, 64]
         for test in [
             (1, 64, 2, 32, 0.1, torch.bfloat16, chunk_size),
+            (1, 129, 2, 128, 0.1, torch.float16, chunk_size),
         ]
     ],
 )

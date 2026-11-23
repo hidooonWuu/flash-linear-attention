@@ -34,6 +34,7 @@ from fla.utils.ascend_ub_manager import (
     launch_grid_chunked,
     max_grid_axis_chunks,
 )
+from fla.utils.hardware import get_npu_arch_series, get_npu_target_arch
 
 _BC_CANDIDATES = (32, 16)
 _O_MEM_MULT = 6.0
@@ -1833,6 +1834,9 @@ def chunk_bwd_dqkwg_npu(
         dqkwg_kwargs['K_OFFSET'] = 0
         dqkwg_kwargs['NT_OFFSET'] = 0
         dqkwg_kwargs['BH_OFFSET'] = 0
+        if BT == 64 and g is None and g_gamma is None and get_npu_arch_series(get_npu_target_arch()) == 'ascend950':
+            # A5 Dynamic CV can assert when scheduling across the barrier before the BC loops.
+            dqkwg_kwargs['enable_dynamic_cv_pipeline'] = False
         _launch_bwd_3d_kernel(kernel=dqkwg_kernel, nk=NK, nt=NT, bh_total=B * HV, kernel_kwargs=dqkwg_kwargs)
 
     if dg is not None and not use_full:
