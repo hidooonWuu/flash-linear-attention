@@ -546,6 +546,12 @@ def chunk_precond_gated_delta_rule(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
+    use_kv_state = (
+        transpose_state_layout and q.device.type == "npu" and torch.npu.get_device_name(q.device).startswith("Ascend950")
+    )
+    if use_kv_state and initial_state is not None:
+        initial_state = initial_state.transpose(-1, -2).contiguous()
+
     o, h_final, a_final = ChunkPrecondGatedDeltaRuleFunction.apply(
         q, k, v,
         g_atk, g,
@@ -558,10 +564,12 @@ def chunk_precond_gated_delta_rule(
         cu_seqlens,
         cu_seqlens_cpu,
         cp_context,
-        transpose_state_layout,
+        transpose_state_layout and not use_kv_state,
         x,
         eps,
         log_atk_scale,
     )
 
+    if use_kv_state and h_final is not None:
+        h_final = h_final.transpose(-1, -2).contiguous()
     return o, h_final, a_final

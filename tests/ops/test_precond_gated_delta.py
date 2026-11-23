@@ -103,11 +103,9 @@ def test_fused_recurrent(
         (q, k, v, beta_atk, beta, g_atk, g, h0, A0, log_atk_scale)
     )
 
-    # Reference implementation: manually L2 normalize; the naive reference
-    # applies the GVA repeat internally when HV > H
     ref, ref_ht, _ = naive_recurrent_precond_gated_delta_rule(
-        q=F.normalize(q.clone(), p=2, dim=-1).to(dtype),
-        k=F.normalize(k.clone(), p=2, dim=-1).to(dtype),
+        q=q.clone(),
+        k=k.clone(),
         v=v.clone(),
         g_atk=g_atk.clone(),
         g=g.clone(),
@@ -142,10 +140,10 @@ def test_fused_recurrent(
 
 
 @pytest.mark.parametrize(
-    ('B', 'T', 'H', 'D', 'scale', 'gate_logit_normalizer', 'mask_p', 'use_qk_l2norm_in_kernel', 'dtype'),
+    ('B', 'T', 'H', 'D', 'scale', 'gate_logit_normalizer', 'mask_p', 'use_qk_l2norm_in_kernel', 'dtype', 'V'),
     [
         pytest.param(
-            *test,
+            *test, test[3],
             id="B{}-T{}-H{}-D{}-scale{}-gln{}-mask_p{}-qk_l2norm{}-{}".format(*test),
         )
         for test in [
@@ -161,6 +159,9 @@ def test_fused_recurrent(
             (1, 33, 1, 256, 0.1, 1, 0, False, torch.float16),
             (1, 129, 1, 256, 0.1, 1, 0, False, torch.float16),
         ]
+    ] + [
+        pytest.param(2, 128, 2, 128, 0.1, 1, 0.5, True, torch.bfloat16, 128, id="bf16-atk-scale"),
+        pytest.param(2, 65, 2, 96, 0.1, 1, 0.5, True, torch.float32, 32, id="fp32-rectangular-tail"),
     ],
 )
 def test_chunk(
@@ -173,13 +174,14 @@ def test_chunk(
     mask_p: float,
     use_qk_l2norm_in_kernel: bool,
     dtype: torch.dtype,
+    V: int,
 ):
     torch.manual_seed(42)
     x = 1.5
 
     q = torch.rand(B, T, H, D, dtype=dtype)
     k = torch.rand(B, T, H, D, dtype=dtype)
-    v = torch.rand(B, T, H, D, dtype=dtype)
+    v = torch.rand(B, T, H, V, dtype=dtype)
     beta_atk = torch.rand(B, T, H, dtype=torch.float).sigmoid()
     beta = torch.rand(B, T, H, dtype=torch.float).sigmoid()
     g_atk = F.logsigmoid(torch.rand(B, T, H, dtype=torch.float32))
@@ -188,7 +190,7 @@ def test_chunk(
     g = F.logsigmoid(torch.rand(B, T, H, dtype=torch.float32))
     g = g / gate_logit_normalizer
     g = g * (torch.rand_like(g) > mask_p)
-    h0 = torch.zeros(B, H, D, D, dtype=torch.float32)
+    h0 = torch.zeros(B, H, D, V, dtype=torch.float32)
 
     log_atk_scale = torch.rand(H, dtype=torch.float32) - 1.0
 
@@ -229,8 +231,9 @@ def test_chunk(
     log_atk_scale.grad = None
 
     ref, ref_ht, _ = naive_recurrent_precond_gated_delta_rule(
-        q=F.normalize(q.clone(), p=2, dim=-1),
-        k=F.normalize(k.clone(), p=2, dim=-1),
+        q=q.clone() if use_qk_l2norm_in_kernel else F.normalize(q.clone(), p=2, dim=-1),
+        k=k.clone() if use_qk_l2norm_in_kernel else F.normalize(k.clone(), p=2, dim=-1),
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         v=v.clone(),
         g_atk=g_atk.clone(),
         g=g.clone(),
@@ -714,6 +717,7 @@ def test_chunk_gva(
     ref, ref_ht, _ = naive_recurrent_precond_gated_delta_rule(
         q=F.normalize(q.clone(), p=2, dim=-1),
         k=F.normalize(k.clone(), p=2, dim=-1),
+        use_qk_l2norm_in_kernel=False,
         v=v.clone(),
         g_atk=g_atk.clone(),
         g=g.clone(),
@@ -816,6 +820,7 @@ def test_chunk_A_state(
     ref, ref_ht, ref_at = naive_recurrent_precond_gated_delta_rule(
         q=F.normalize(q.clone(), p=2, dim=-1),
         k=F.normalize(k.clone(), p=2, dim=-1),
+        use_qk_l2norm_in_kernel=False,
         v=v.clone(),
         g_atk=g_atk.clone(),
         g=g.clone(),

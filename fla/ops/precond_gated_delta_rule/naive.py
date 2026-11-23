@@ -25,6 +25,7 @@ def naive_recurrent_precond_gated_delta_rule(
     eps: float = 1e-6,
     log_atk_scale: torch.Tensor | float = None,
     cu_seqlens: torch.LongTensor | None = None,
+    use_qk_l2norm_in_kernel: bool = True,
 ):
     """
     Reference PyTorch implementation of recurrent preconditioned gated delta rule.
@@ -42,6 +43,7 @@ def naive_recurrent_precond_gated_delta_rule(
         initial_A_state: [B, H, K], optional
         output_final_state: bool
         cu_seqlens: [N+1], optional cumulative sequence lengths for packed inputs
+        use_qk_l2norm_in_kernel: Normalize raw queries and keys before the recurrence.
 
     GVA is applied if `HV > H` (with `HV` divisible by `H`): each group of
     `HV // H` value heads shares one key head and its ATK preconditioner state.
@@ -70,6 +72,7 @@ def naive_recurrent_precond_gated_delta_rule(
                 x=x,
                 eps=eps,
                 log_atk_scale=log_atk_scale,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             )
             outputs.append(o_i)
             if output_final_state:
@@ -106,9 +109,10 @@ def naive_recurrent_precond_gated_delta_rule(
     if scale is None:
         scale = 1 / (K ** 0.5)
 
-    # L2 normalize q and k, then apply scale
-    q = F.normalize(q, p=2, dim=-1) * scale
-    k = F.normalize(k, p=2, dim=-1)
+    if use_qk_l2norm_in_kernel:
+        q = F.normalize(q, p=2, dim=-1)
+        k = F.normalize(k, p=2, dim=-1)
+    q = q * scale
 
     if log_atk_scale is None:
         log_atk_scale = -0.2

@@ -14,7 +14,7 @@ import triton
 import triton.language as tl
 
 from fla.backends import TritonAscendBackend, register
-from fla.ops.common.backends.triton_ascend.chunk_delta_h import need_dma_mask, time_axis_needs_mask
+from fla.ops.common.backends.triton_ascend.chunk_delta_h import _pad_dense_tail_tokens, need_dma_mask, time_axis_needs_mask
 from fla.ops.gated_delta_rule.backends.triton_ascend import wy_fast
 from fla.ops.precond_gated_delta_rule.chunk_precond_wy_bwd import prepare_precond_wy_repr_bwd
 from fla.ops.utils import prepare_chunk_indices
@@ -189,6 +189,39 @@ def prepare_precond_wy_repr_bwd_npu(
     B, T, H, K = k.shape
     HV, V = v.shape[2], v.shape[-1]
     BT = A.shape[-1]
+    is_ascend950 = torch.npu.get_device_name(k.device).startswith("Ascend950")
+    if is_ascend950 and T:
+        boundaries = [0, T] if cu_seqlens is None else cu_seqlens.tolist()
+        padded_k, padded_v = triton.next_power_of_2(K), triton.next_power_of_2(V)
+        if K != padded_k or V != padded_v or any((end - start) % BT for start, end in zip(boundaries, boundaries[1:])):
+            # keep the masked time and feature lanes out of the WY backward Cube reductions on 950
+            parts = [[] for _ in range(5)]
+            for start, end in zip(boundaries, boundaries[1:]):
+                length = end - start
+                if not length:
+                    continue
+                padded_t = triton.cdiv(length, BT) * BT
+                tensors = []
+                for tensor, feature_pad in (
+                    (k, padded_k - K), (k_precond, padded_k - K), (v, padded_v - V),
+                    (beta, 0), (A, 0), (dw, padded_k - K), (du, padded_v - V),
+                ):
+                    segment = tensor[:, start:end].contiguous()
+                    if feature_pad:
+                        segment = torch.nn.functional.pad(segment, (0, feature_pad))
+                    tensors.append(_pad_dense_tail_tokens(segment, padded_t))
+                g_segment = None if g is None else _pad_dense_tail_tokens(g[:, start:end], padded_t, repeat_last=True)
+                dk_seg, dkp_seg, dv_seg, db_seg, dg_seg = prepare_precond_wy_repr_bwd_npu(
+                    *tensors[:4], g_segment, *tensors[4:],
+                )
+                for dest, result in zip(parts, (dk_seg[..., :K], dkp_seg[..., :K], dv_seg[..., :V], db_seg)):
+                    dest.append(result[:, :length])
+                if dg_seg is not None:
+                    dg_valid = dg_seg[:, :length].contiguous()
+                    if length != padded_t:
+                        dg_valid[:, -1] += dg_seg[:, length:].sum(1)
+                    parts[4].append(dg_valid)
+            return tuple(torch.cat(group, dim=1) if group else None for group in parts)
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
@@ -261,6 +294,8 @@ def prepare_precond_wy_repr_bwd_npu(
             DB_T_CONTIG=db_t_contig,
             MASK_DMA=mask_dma,
             G_EXP_PRECOMP=g_exp_precomp,
+            # Rounding the gated operands before dA biases the per-head ATK scale gradient.
+            DA_FP32=is_ascend950 and k.dtype == torch.bfloat16,
             **core_base,
         ),
     )

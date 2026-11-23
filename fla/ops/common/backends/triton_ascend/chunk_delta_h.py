@@ -1983,6 +1983,21 @@ def chunk_gated_delta_rule_bwd_dhu_npu(
     # masked image still overflows (D=100 / two slabs). Pad onto the power-of-two
     # tile the aligned kernel already compiles and slice the gradients back.
     K_orig, V_orig = K, V
+    T_orig = T
+    if (
+        cu_seqlens is None and gk is None and T % BT and K > 64 and K % 64
+        and q.dtype == torch.float32 and q.device.type == "npu"
+        and torch.npu.get_device_name(q.device).startswith("Ascend950")
+    ):
+        # Masking both the time tail and a partial FP32 key slab exceeds the 950 UB.
+        # A repeated cumulative gate preserves the final-state gradient at the true endpoint.
+        T = NT * BT
+        q = _pad_dense_tail_tokens(q, T)
+        k = _pad_dense_tail_tokens(k, T)
+        w = _pad_dense_tail_tokens(w, T)
+        do = _pad_dense_tail_tokens(do, T)
+        dv = _pad_dense_tail_tokens(dv, T)
+        g = _pad_dense_tail_tokens(g, T, repeat_last=True)
     if not time_axis_needs_mask(T, BT, cu_seqlens, cu_seqlens_cpu):
         k_pad = triton.next_power_of_2(K)
         v_pad = triton.next_power_of_2(V)
@@ -2093,4 +2108,6 @@ def chunk_gated_delta_rule_bwd_dhu_npu(
             if dh0 is not None:
                 dh0 = dh0[..., :K_orig, :V_orig].contiguous()
         dv2 = dv2[..., :V_orig].contiguous()
+    if T_orig != T:
+        dv2 = dv2[:, :T_orig].contiguous()
     return dh, dh0, dv2

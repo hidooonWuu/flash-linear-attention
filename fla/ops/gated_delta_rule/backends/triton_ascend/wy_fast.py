@@ -338,6 +338,7 @@ def prepare_wy_repr_bwd_kv_npu(
     G_T_CONTIG: tl.constexpr, BETA_T_CONTIG: tl.constexpr,
     DG_T_CONTIG: tl.constexpr, DB_T_CONTIG: tl.constexpr,
     G_EXP_PRECOMP: tl.constexpr, MASK_DMA: tl.constexpr,
+    DA_FP32: tl.constexpr = False,
 ):
     """K/V backward stage on a 1D Cube core-grid.
 
@@ -345,6 +346,8 @@ def prepare_wy_repr_bwd_kv_npu(
     ASCEND_MAX_GRID_DIM. Rebind local pointers every task iteration.
     """
     T_seq = T
+    DA_K_DTYPE: tl.constexpr = tl.float32 if DA_FP32 else k.dtype.element_ty
+    DA_V_DTYPE: tl.constexpr = tl.float32 if DA_FP32 else v.dtype.element_ty
     core_id = tl.program_id(0)
     for task_id in tl.range(core_id, task_num, num_core):
         i_t_o = task_id // (B * HV)
@@ -419,13 +422,13 @@ def prepare_wy_repr_bwd_kv_npu(
             b_dw_c = b_dw + 0.0
             b_A_c = b_A.to(b_dw.dtype) + 0.0
             if USE_G:
-                b_kbg = (b_k.to(tl.float32) * b_bg[:, None]).to(b_k.dtype)
+                b_kbg = (b_k.to(tl.float32) * b_bg[:, None]).to(DA_K_DTYPE)
             else:
-                b_kbg = (b_k.to(tl.float32) * b_b[:, None]).to(b_k.dtype)
+                b_kbg = (b_k.to(tl.float32) * b_b[:, None]).to(DA_K_DTYPE)
             # Explicit transpose, then dot. Nested tl.trans() inside tl.dot
             # miscompiles in this kernel on triton-ascend.
             b_kbg_T = tl.trans(b_kbg)
-            b_dA = tl.dot(b_dw, b_kbg_T, b_dA, allow_tf32=False)
+            b_dA = tl.dot(b_dw.to(DA_K_DTYPE), b_kbg_T, b_dA, allow_tf32=False)
             b_dkbg = tl.dot(b_A_c, b_dw_c, allow_tf32=False).to(tl.float32)
             b_k_f = b_k.to(tl.float32)
             if USE_G:
@@ -451,9 +454,9 @@ def prepare_wy_repr_bwd_kv_npu(
             b_du = mload(p_du, m_p_v, MASK_DMA)
             b_du_c = b_du + 0.0
             b_A_c = b_A.to(b_du.dtype) + 0.0
-            b_vb = (b_v.to(tl.float32) * b_b[:, None]).to(b_v.dtype)
+            b_vb = (b_v.to(tl.float32) * b_b[:, None]).to(DA_V_DTYPE)
             b_vb_T = tl.trans(b_vb)
-            b_dA = tl.dot(b_du, b_vb_T, b_dA, allow_tf32=False)
+            b_dA = tl.dot(b_du.to(DA_V_DTYPE), b_vb_T, b_dA, allow_tf32=False)
             b_dvb = tl.dot(b_A_c, b_du_c, allow_tf32=False).to(tl.float32)
             b_v_f = b_v.to(tl.float32)
             b_dv = b_dvb * b_b[:, None]
