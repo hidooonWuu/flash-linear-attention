@@ -7,8 +7,8 @@
 
 """GLA state kernels for Ascend NPU.
 
-Ascend requires host-specialized `NT` with `tl.static_range(NT)`;
-a dynamic loop under-iterates when `T` is unspecialized.
+Older Ascend targets need static unrolling when `T` is unspecialized.
+Ascend 950 keeps the time loop rolled so its state tiles fit in on-chip memory.
 The host wrappers split packed variable-length inputs into individual sequences.
 """
 
@@ -22,7 +22,8 @@ from fla.backends import TritonAscendBackend, register
 from fla.ops.common.chunk_h import chunk_bwd_dh, chunk_fwd_h
 from fla.ops.utils import prepare_chunk_offsets
 from fla.ops.utils.op import exp2
-from fla.utils import input_guard
+from fla.ops.utils.triton_ascend.addressing import clamp_token_rows
+from fla.utils import get_device_arch, input_guard
 from fla.utils.ascend_ub_manager import launch_grid_chunked
 
 # fixed tiles prevent autotuning from selecting configurations that overflow UB.
@@ -61,6 +62,7 @@ def chunk_h_fwd_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     NT: tl.constexpr,
+    IS_ASCEND_950: tl.constexpr,
     USE_G: tl.constexpr,
     USE_G_GAMMA: tl.constexpr,
     USE_GK: tl.constexpr,
@@ -96,10 +98,12 @@ def chunk_h_fwd_kernel(
             p_h0 = h0 + h0_base + o_k[:, None].to(tl.int64) * V + o_v[None, :]
             b_h = tl.load(p_h0, mask=(o_k[:, None] < K) & (o_v[None, :] < V), other=0.0).to(tl.float32)
 
-    for i_t in tl.static_range(NT):
+    for i_t in (range if IS_ASCEND_950 else tl.static_range)(NT):
         i_s = i_t // NTS
         o_t = (i_t * BT + tl.arange(0, BT)).to(tl.int64)
         m_t = o_t < T
+        if IS_ASCEND_950:
+            o_t = clamp_token_rows(o_t, T)
         kv_base = (bos * H + i_h) * K
         p_k = k + kv_base + o_k[:, None] + o_t[None, :] * (H * K)
         p_v = v + (bos * H + i_h) * V + o_t[:, None] * (H * V) + o_v[None, :]
@@ -186,6 +190,7 @@ def chunk_h_bwd_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     NT: tl.constexpr,
+    IS_ASCEND_950: tl.constexpr,
     NG: tl.constexpr,
     USE_G: tl.constexpr,
     USE_G_GAMMA: tl.constexpr,
@@ -222,7 +227,7 @@ def chunk_h_bwd_kernel(
             p_dht = dht + dht_base + o_k[:, None].to(tl.int64) * V + o_v[None, :]
             b_dh += tl.load(p_dht, mask=(o_k[:, None] < K) & (o_v[None, :] < V), other=0.0).to(tl.float32)
 
-    for step in tl.static_range(NT):
+    for step in (range if IS_ASCEND_950 else tl.static_range)(NT):
         i_t = NT - 1 - step
         i_s = i_t // (BS // BT)
         o_dh = ((boh + i_s) * H + i_h) * K * V
@@ -239,6 +244,8 @@ def chunk_h_bwd_kernel(
         last_idx = min(i_t * BT + BT, T) - 1
         o_t = (i_t * BT + tl.arange(0, BT)).to(tl.int64)
         m_t = o_t < T
+        if IS_ASCEND_950:
+            o_t = clamp_token_rows(o_t, T)
         qv_base = bos * HQ + i_hq
         p_q = q + qv_base * K + o_k[:, None] + o_t[None, :] * (HQ * K)
         p_do = do + qv_base * V + o_t[:, None] * (HQ * V) + o_v[None, :]
@@ -401,6 +408,7 @@ def chunk_fwd_h_npu(
             BK=BK,
             BV=BV,
             NT=NT,
+            IS_ASCEND_950=get_device_arch().startswith('Ascend950'),
             USE_G=g is not None,
             USE_G_GAMMA=g_gamma is not None,
             USE_GK=gk is not None,
@@ -516,6 +524,7 @@ def chunk_bwd_dh_npu(
             BK=BK,
             BV=BV,
             NT=NT,
+            IS_ASCEND_950=get_device_arch().startswith('Ascend950'),
             NG=NG,
             USE_G=g is not None,
             USE_G_GAMMA=g_gamma is not None,

@@ -22,6 +22,28 @@ from fla.ops.simple_gla.parallel import parallel_simple_gla
 from fla.utils import assert_close, device
 
 
+@pytest.mark.skipif(not utils.IS_NPU, reason='Ascend state kernel')
+@pytest.mark.parametrize('T', [15, 79])
+def test_ascend_state_masked_tail(T):
+    from fla.ops.common.backends.triton_ascend.chunk_h import chunk_bwd_dh_npu, chunk_fwd_h_npu
+
+    # Keep the tail inside the allocation so the masked lanes have known values.
+    padded_t = (T + 63) // 64 * 64
+    left = torch.ones((1, padded_t, 4, 64), device=device, dtype=torch.float16)
+    right = torch.ones_like(left)
+    left[:, T:] = float('nan')
+    right[:, T:] = 0
+    qk, v = left[:, :T], right[:, :T]
+    state = torch.zeros((1, 4, 64, 64), device=device, dtype=torch.float32)
+
+    _, ht = chunk_fwd_h_npu(k=qk, v=v, h0=state, output_final_state=True)
+    _, dh0 = chunk_bwd_dh_npu(q=qk, k=qk, v=v, do=v, h0=state, dht=state, scale=1.)
+
+    expected = torch.full_like(state, T)
+    torch.testing.assert_close(ht, expected, rtol=0, atol=0)
+    torch.testing.assert_close(dh0, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
     ('B', 'T', 'H', 'D', 'scale', 'gate_logit_normalizer', 'dtype'),
     [
