@@ -110,7 +110,7 @@ jobs:
         python:
           - "3.12"
         os:
-          - "linux-aarch64-a5-8"
+          - "linux-aarch64-a5-2"
 
     runs-on: ${{ matrix.os }}
 
@@ -129,7 +129,7 @@ jobs:
 
     env:
       FLA_CI_ENV: 1
-      ASCEND_RT_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+      ASCEND_RT_VISIBLE_DEVICES: "0,1"
       TRITON_CACHE_DIR: ${{ github.workspace }}/.triton-a5-tests-cache
 
     steps:
@@ -193,7 +193,7 @@ jobs:
           FLA_NPU_XDIST: "1"
         run: |
           source /usr/local/Ascend/ascend-toolkit/set_env.sh
-          pytest -s -v --exitfirst -n 8 --dist load \
+          pytest -s -v --exitfirst -n 2 --dist load \
             tests/utils \
             tests/benchmarks/test_graph_benchmark.py \
             tests/modules/residuals/test_attnres.py \
@@ -214,6 +214,7 @@ jobs:
             tests/ops/test_oja.py \
             tests/ops/test_parallax.py \
             tests/ops/test_solve_tril.py \
+            tests/ops/test_ttt.py \
             tests/ops/test_wall_attn.py \
             tests/ops/utils/test_csr.py \
             tests/ops/utils/test_cumsum.py \

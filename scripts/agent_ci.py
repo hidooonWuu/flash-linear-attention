@@ -103,7 +103,8 @@ def run_targets(catalog: dict, repo: Path, platform: str, suite: str, targets: l
     failures = []
     pytest_args = []
     if platform in {"ascend-a2", "ascend-a5"} and suite != "cp":
-        pytest_args = ["-n", "8", "--dist", "load"]
+        workers = "2" if platform == "ascend-a5" else "8"
+        pytest_args = ["-n", workers, "--dist", "load"]
     for mode in validate_dispatch(catalog, suite, dispatch):
         for index, target in enumerate(targets):
             junit = results / f"{mode}-{index}.xml"
